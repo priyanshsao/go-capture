@@ -12,109 +12,148 @@ import (
 	"github.com/google/gopacket/pcap"
 )
 
+type PacketInfo struct {
+	Timestamp   time.Time
+	Protocol    string
+	SrcIP       string
+	DstIP       string
+	SrcPort     string
+	DstPort     string
+	TCPFlags    string
+	Length      int
+	HTTPInfo    string
+	SeqNum      uint32
+	AckNum      uint32
+}
+
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: sudo go run main.go <domain>")
-		fmt.Println("Example: sudo go run main.go google.com")
+		fmt.Println("Usage: go run main.go <domain>")
+		fmt.Println("Example: go run main.go google.com")
 		os.Exit(1)
 	}
 
 	domain := os.Args[1]
-	fmt.Printf("🔍 Packet Tracer for: %s\n", domain)
-	fmt.Println("\n📡 Waiting for packets... (Make a curl request in another terminal)")
-	fmt.Printf("   curl http://%s\n\n", domain)
+	fmt.Printf("Starting packet capture for domain: %s\n", domain)
+	fmt.Println("Make a curl request to the domain in another terminal:")
+	fmt.Printf("  curl http://%s\n", domain)
+	fmt.Println("\nPress Ctrl+C to stop capture\n")
+	fmt.Println(strings.Repeat("=", 100))
 
+	// Find all network devices
 	devices, err := pcap.FindAllDevs()
 	if err != nil {
 		log.Fatal(err)
 	}
 
+	if len(devices) == 0 {
+		log.Fatal("No network devices found")
+	}
+
+	// Use the first available device (you might want to select a specific one)
 	device := devices[0].Name
+	fmt.Printf("Capturing on device: %s\n\n", device)
+
+	// Open device for packet capture
 	handle, err := pcap.OpenLive(device, 1600, true, pcap.BlockForever)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer handle.Close()
 
-	filter := fmt.Sprintf("tcp and host %s", domain)
+	// Set filter for HTTP traffic (port 80 and 443)
+	filter := fmt.Sprintf("host %s or (tcp port 80 or tcp port 443)", domain)
 	err = handle.SetBPFFilter(filter)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
+	
 	startTime := time.Now()
-	packetCount := 0
 
 	for packet := range packetSource.Packets() {
-		packetCount++
-		analyzePacket(packet, startTime, packetCount)
+		processPacket(packet, domain, startTime)
 	}
 }
 
-func analyzePacket(packet gopacket.Packet, startTime time.Time, count int) {
-	timestamp := packet.Metadata().Timestamp
-	elapsed := timestamp.Sub(startTime).Seconds()
+func processPacket(packet gopacket.Packet, domain string, startTime time.Time) {
+	var info PacketInfo
+	info.Timestamp = packet.Metadata().Timestamp
+	info.Length = packet.Metadata().Length
+	
+	relativeTime := info.Timestamp.Sub(startTime)
 
-	var srcIP, dstIP, srcPort, dstPort string
-	var tcpFlags []string
-	var seq, ack uint32
-
-	// Get IP info
+	// Parse network layer
 	if ipLayer := packet.Layer(layers.LayerTypeIPv4); ipLayer != nil {
 		ip, _ := ipLayer.(*layers.IPv4)
-		srcIP = ip.SrcIP.String()
-		dstIP = ip.DstIP.String()
+		info.SrcIP = ip.SrcIP.String()
+		info.DstIP = ip.DstIP.String()
+		info.Protocol = ip.Protocol.String()
 	}
 
-	// Get TCP info
+	// Parse TCP layer
 	if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
 		tcp, _ := tcpLayer.(*layers.TCP)
-		srcPort = tcp.SrcPort.String()
-		dstPort = tcp.DstPort.String()
-		seq = tcp.Seq
-		ack = tcp.Ack
+		info.SrcPort = tcp.SrcPort.String()
+		info.DstPort = tcp.DstPort.String()
+		info.SeqNum = tcp.Seq
+		info.AckNum = tcp.Ack
 
+		// Get TCP flags
+		var flags []string
 		if tcp.SYN {
-			tcpFlags = append(tcpFlags, "SYN")
+			flags = append(flags, "SYN")
 		}
 		if tcp.ACK {
-			tcpFlags = append(tcpFlags, "ACK")
+			flags = append(flags, "ACK")
 		}
 		if tcp.FIN {
-			tcpFlags = append(tcpFlags, "FIN")
+			flags = append(flags, "FIN")
 		}
 		if tcp.RST {
-			tcpFlags = append(tcpFlags, "RST")
+			flags = append(flags, "RST")
 		}
 		if tcp.PSH {
-			tcpFlags = append(tcpFlags, "PSH")
+			flags = append(flags, "PSH")
 		}
+		if tcp.URG {
+			flags = append(flags, "URG")
+		}
+		info.TCPFlags = strings.Join(flags, ",")
 	}
 
-	// Print formatted output
-	fmt.Printf("[%.6fs] Packet #%d\n", elapsed, count)
-	fmt.Printf("  ├─ Source:      %s:%s\n", srcIP, srcPort)
-	fmt.Printf("  ├─ Destination: %s:%s\n", dstIP, dstPort)
-	
-	if len(tcpFlags) > 0 {
-		fmt.Printf("  ├─ TCP Flags:   %s\n", strings.Join(tcpFlags, " + "))
-	}
-	
-	fmt.Printf("  ├─ Seq:         %d\n", seq)
-	fmt.Printf("  └─ Ack:         %d\n", ack)
-
-	// Check for HTTP data
+	// Parse HTTP layer
 	if appLayer := packet.ApplicationLayer(); appLayer != nil {
 		payload := string(appLayer.Payload())
-		if strings.HasPrefix(payload, "GET") || strings.HasPrefix(payload, "POST") || 
-		   strings.HasPrefix(payload, "HTTP") {
+		if strings.HasPrefix(payload, "GET") || strings.HasPrefix(payload, "POST") ||
+			strings.HasPrefix(payload, "HTTP") {
 			lines := strings.Split(payload, "\r\n")
 			if len(lines) > 0 {
-				fmt.Printf("  └─ HTTP:        %s\n", lines[0])
+				info.HTTPInfo = lines[0]
 			}
 		}
 	}
 
-	fmt.Println()
+	// Print packet information
+	printPacketInfo(info, relativeTime)
+}
+
+func printPacketInfo(info PacketInfo, relativeTime time.Duration) {
+	timestamp := info.Timestamp.Format("15:04:05.000000")
+	
+	fmt.Printf("[%s] (+%.6fs)\n", timestamp, relativeTime.Seconds())
+	fmt.Printf("  %s:%s → %s:%s\n", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort)
+	
+	if info.TCPFlags != "" {
+		fmt.Printf("  TCP Flags: %s\n", info.TCPFlags)
+		fmt.Printf("  Seq: %d, Ack: %d\n", info.SeqNum, info.AckNum)
+	}
+	
+	if info.HTTPInfo != "" {
+		fmt.Printf("  HTTP: %s\n", info.HTTPInfo)
+	}
+	
+	fmt.Printf("  Length: %d bytes\n", info.Length)
+	fmt.Println(strings.Repeat("-", 100))
 }
